@@ -1,0 +1,35 @@
+{
+  "excel_path": "Data.xlsx",
+  "seed": 42,
+  "data": {
+    "expected_cols": 204,
+    "start_curve_col": 3,
+    "end_curve_col": 204,
+    "train_ratio": 0.8,
+    "val_ratio_within_train": 0.1,
+    "dropna": true,
+    "clip_outliers": true,
+    "clip_low": 0.005,
+    "clip_high": 0.995
+  },
+  "train": {
+    "epochs": 1000,
+    "batch_size": 16,
+    "lr": 0.001,
+    "weight_decay": 1e-06,
+    "patience": 50,
+    "save_every": 100,
+    "num_workers": 0,
+    "resume": false,
+    "ckpt_dir": "./checkpoints",
+    "log_dir": "./logs",
+    "plot_dir": "./plots"
+  },
+  "model": {
+    "width": 64,
+    "modes": 16,
+    "layers": 4,
+    "mlp_hidden": 128,
+    "dropout": 0.0
+  }
+}
