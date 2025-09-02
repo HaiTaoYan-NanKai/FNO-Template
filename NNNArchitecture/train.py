@@ -105,22 +105,51 @@ def main():
     logger = get_logger(log_dir, "train")
     logger.info(f"设备: {device}")
 
-    # ----- Data -----
-    dcfg = DataConfig(excel_path=cfg.excel_path,
-                      expected_cols=cfg["data"]["expected_cols"],
-                      start_curve_col=cfg["data"]["start_curve_col"],
-                      end_curve_col=cfg["data"]["end_curve_col"],
-                      train_ratio=cfg["data"]["train_ratio"],
-                      val_within_train_ratio=cfg["data"]["val_ratio_within_train"],
-                      random_seed=cfg.seed,
-                      dropna=cfg["data"]["dropna"],
-                      clip_outliers=cfg["data"]["clip_outliers"],
-                      clip_low=cfg["data"]["clip_low"],
-                      clip_high=cfg["data"]["clip_high"])
-    df = load_excel_dataframe(dcfg.excel_path)
-    tl, vl, te, in_scaler, out_scaler, seq_len = build_dataloaders(
-        df, dcfg, cfg["train"]["batch_size"], cfg["train"]["num_workers"]
+    # ----- Data：数据准备阶段 -----
+    # 构建 DataConfig 配置对象，把 config.json 中关于数据的超参数集中传入
+    # - excel_path: Excel 数据文件路径
+    # - expected_cols: 期望的总列数（用于简单校验，防止 Excel 列数不对）
+    # - start_curve_col / end_curve_col: 曲线数据在 Excel 中的起始/结束列（包含端点）
+    # - train_ratio: 训练集比例（剩下的作为测试集）
+    # - val_within_train_ratio: 验证集在训练集中的比例
+    # - random_seed: 随机种子，保证数据划分可复现
+    # - dropna: 是否丢弃包含缺失值的行
+    # - clip_outliers: 是否对曲线做分位裁剪（去除极端值）
+    # - clip_low / clip_high: 裁剪的上下分位点（如 0.5% 与 99.5%）
+    dcfg = DataConfig(
+        excel_path=cfg.excel_path,
+        expected_cols=cfg["data"]["expected_cols"],
+        start_curve_col=cfg["data"]["start_curve_col"],
+        end_curve_col=cfg["data"]["end_curve_col"],
+        train_ratio=cfg["data"]["train_ratio"],
+        val_within_train_ratio=cfg["data"]["val_ratio_within_train"],
+        random_seed=cfg.seed,
+        dropna=cfg["data"]["dropna"],
+        clip_outliers=cfg["data"]["clip_outliers"],
+        clip_low=cfg["data"]["clip_low"],
+        clip_high=cfg["data"]["clip_high"]
     )
+
+    # 读取 Excel 文件为 pandas.DataFrame
+    # - 内部会调用 openpyxl 引擎
+    # - 若文件不存在或被占用会抛出异常
+    df = load_excel_dataframe(dcfg.excel_path)
+
+    # 根据配置与 DataFrame 构建 DataLoader
+    # - build_dataloaders 会做几件事：
+    #   1. 先用数据 fit 输入/输出的 StandardScaler（保存 mean/std）
+    #   2. 重建 Dataset，把 X/Y 转换到标准化空间
+    #   3. 按比例切分 train/val/test
+    #   4. 返回三个 DataLoader，保证训练集 shuffle，验证/测试不打乱
+    #   5. 返回 in_scaler / out_scaler，方便后续保存与推理时反标准化
+    #   6. 返回序列长度 seq_len，供模型构造时使用
+    tl, vl, te, in_scaler, out_scaler, seq_len = build_dataloaders(
+        df,
+        dcfg,
+        cfg["train"]["batch_size"],   # 每个 batch 样本数
+        cfg["train"]["num_workers"]   # DataLoader 的工作进程数（0 表示主进程）
+    )
+
 
     ckpt_dir = cfg["train"]["ckpt_dir"]; ensure_dir(ckpt_dir)
     save_scalers(in_scaler, out_scaler, Path(ckpt_dir)/"scalers.json")
@@ -178,31 +207,66 @@ def main():
 
 
 
-    # ----- Train Loop -----
-    patience, pc = cfg["train"]["patience"], 0
+   # ----- Train Loop：主训练循环 -----
+    patience, pc = cfg["train"]["patience"], 0   # patience=允许“验证不提升”的最大轮数；pc=当前已连续未提升的轮数
     for epoch in range(start_epoch, cfg["train"]["epochs"] + 1):
         t0 = time.time()
+
+        # 1) 训练一个 epoch（返回训练集平均损失）
         tr = train_one_epoch(model, tl, device, opt, crit)
+
+        # 2) 在验证集上评估（返回验证集平均损失）
         va = eval_epoch(model, vl, device, crit)
+
+        # 3) 把“验证损失”喂给学习率调度器；若长期无提升，则自动降低学习率
         sch.step(va)
+
+        # 4) 记录当前学习率（从优化器里读出来）
         lr_now = opt.param_groups[0]["lr"]
+
+        # 5) 将本轮的 train/val loss 与 lr 追加写入 CSV（便于画曲线）
         with open(csv_path, "a", encoding="utf-8") as f:
             f.write(f"{epoch},{tr:.6f},{va:.6f},{lr_now:.8f}\n")
-        logger.info(f"[{epoch}/{cfg['train']['epochs']}] train={tr:.6e} | val={va:.6e} | lr={lr_now:.2e} | {time.time()-t0:.1f}s")
 
+        # 6) 控制台与日志文件打印本轮信息（科学计数法 & 本轮耗时）
+        logger.info(
+            f"[{epoch}/{cfg['train']['epochs']}] "
+            f"train={tr:.6e} | val={va:.6e} | lr={lr_now:.2e} | {time.time()-t0:.1f}s"
+        )
+
+        # 7) 判断验证集是否“显著提升”（阈值 1e-8），若提升则保存“最佳模型”并清零计数
         improved = va < best_val - 1e-8
         if improved:
-            best_val = va; torch.save(model.state_dict(), best_path); pc = 0
+            best_val = va
+            torch.save(model.state_dict(), best_path)  # 仅保存权重（推理/最终评估用）
+            pc = 0
             logger.info(f"保存最佳模型 -> {best_path}")
         else:
-            pc += 1
+            pc += 1  # 未提升则累计“无提升”轮数
+
+        # 8) 周期性保存检查点（按配置的 save_every），便于中途回溯/恢复
         if epoch % cfg["train"]["save_every"] == 0:
-            ep_path = Path(ckpt_dir)/f"epoch_{epoch}.pth"; torch.save(model.state_dict(), ep_path)
+            ep_path = Path(ckpt_dir) / f"epoch_{epoch}.pth"
+            torch.save(model.state_dict(), ep_path)
             logger.info(f"保存检查点 -> {ep_path}")
-        torch.save({"epoch": epoch, "model": model.state_dict(), "opt": opt.state_dict(),
-                    "sch": sch.state_dict(), "best_val": best_val}, state_path)
+
+        # 9) 保存“训练器状态”（断点续训用）：包含 epoch、模型/优化器/调度器状态与 best_val
+        torch.save(
+            {
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "opt":   opt.state_dict(),
+                "sch":   sch.state_dict(),
+                "best_val": best_val
+            },
+            state_path
+        )
+
+        # 10) 早停：若连续 pc 次验证都未提升（pc >= patience），提前停止训练
         if pc >= patience:
-            logger.info(f"早停：验证集 {patience} 次未提升"); break
+            logger.info(f"早停：验证集 {patience} 次未提升")
+            break
+
 
     # ----- Test & Visualize：测试与可视化 -----
     # 若存在“最佳模型”权重，则先加载它再做评估（以最佳泛化性能作报告）
@@ -248,6 +312,7 @@ def main():
     true_curves = StandardScaler1D().inverse_transform(xb_n)  # 注意：这里只用于画图示意
 
     # 用近似前向模型把预测的 (σ_y, n) 生成“预测曲线”，与真实输入曲线做可视化对比（抽样 num_examples 条）
+    '''
     plot_curves_compare(
         cfg["train"]["plot_dir"],
         true_curves,
@@ -255,7 +320,7 @@ def main():
         curve_len=xb_n.shape[1],
         num_examples=3
     )
-
+    '''
     logger.info("[完成] 训练与测试结束。")
 
 
